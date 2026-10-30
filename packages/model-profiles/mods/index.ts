@@ -49,34 +49,64 @@ interface SwitchOptions {
   scope?: "conversation" | "agent";
 }
 
+type MaxOutputStatus =
+  | { status: "written" | "unchanged"; value: number }
+  | { status: "failed"; value: number; error: string }
+  | { status: "not_applicable" };
+
 const FILE_NAME = "model-profiles.json";
 
 let reportWarning: (message: string) => void = () => {};
 
+const CONVERSATION_REQUEST_TIMEOUT_MS = 5000;
+
 /**
  * The SDK client, resolved at activation. Event handler contexts do not carry a
- * client, so this is the only way to reach `conversations.update` — which matters
- * because `updateLlmConfig` cannot express `max_output_tokens`.
+ * client, so this is the only way to read the conversation or write
+ * `max_output_tokens`, which `updateLlmConfig` cannot express.
  *
  * In listener-hosted mods this value is a truthy lazy proxy whose calls throw, so
  * every read and write goes through the SDK-then-REST helpers below rather than
  * this value directly. A non-null `sdkClient` is NOT evidence that the SDK works.
  */
 let sdkClient: LettaClientLike | null = null;
+let resolveClient: (() => Promise<LettaClientLike>) | null = null;
+let clientPromise: Promise<LettaClientLike> | null = null;
 
-function clientConversations(): LettaClientLike["conversations"] | null {
-  const conversations = sdkClient?.conversations;
-  if (!conversations || typeof conversations.retrieve !== "function" || typeof conversations.update !== "function") {
-    return null;
+async function getConversationClient(): Promise<LettaClientLike> {
+  if (!resolveClient) {
+    if (sdkClient) return sdkClient;
+    throw new Error("letta.getClient is not available in this Letta Code runtime");
   }
-  return conversations;
+  clientPromise ??= resolveClient();
+  return clientPromise;
+}
+
+async function withRequestTimeout<T>(operation: (signal: AbortSignal) => Promise<T>, label: string): Promise<T> {
+  const controller = new AbortController();
+  let rejectTimeout: (reason: Error) => void = () => {};
+  const timedOut = new Promise<never>((_, reject) => {
+    rejectTimeout = reject;
+  });
+  const timeout = setTimeout(() => {
+    const error = new Error(`${label} timed out after ${CONVERSATION_REQUEST_TIMEOUT_MS}ms`);
+    error.name = "AbortError";
+    controller.abort(error);
+    rejectTimeout(error);
+  }, CONVERSATION_REQUEST_TIMEOUT_MS);
+  try {
+    return await Promise.race([operation(controller.signal), timedOut]);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 /**
  * Listener-hosted mods get a `letta.client` that is a truthy lazy proxy over a stub
- * that throws, so `clientConversations()` returns something callable that fails at
- * call time. The listener process does carry LETTA_BASE_URL and LETTA_API_KEY in its
- * environment, so authenticated REST is the reliable path there.
+ * that throws, and `getClient` rejects the same way. The listener process does
+ * carry LETTA_BASE_URL and LETTA_API_KEY in its environment, so authenticated REST
+ * is the reliable path there. This is a constrained fallback, not a general HTTP
+ * transport: the credential is sent only to that configured Letta origin.
  */
 function restBaseUrl(): string | null {
   const raw = process.env.LETTA_BASE_URL || process.env.LETTA_API_BASE || "";
@@ -91,7 +121,7 @@ function restApiKey(): string | null {
 
 async function restConversation(
   conversationId: string,
-  init?: { method?: string; body?: Record<string, unknown> },
+  init?: { method?: string; body?: Record<string, unknown>; signal?: AbortSignal },
 ): Promise<Record<string, unknown>> {
   const base = restBaseUrl();
   const key = restApiKey();
@@ -105,6 +135,7 @@ async function restConversation(
       "Content-Type": "application/json",
     },
     body: init?.body ? JSON.stringify(init.body) : undefined,
+    signal: init?.signal,
   });
   if (!response.ok) {
     const text = await response.text().catch(() => "");
@@ -115,36 +146,34 @@ async function restConversation(
 
 /** Read a conversation, preferring the SDK and falling back to REST. */
 async function retrieveConversation(conversationId: string): Promise<Record<string, unknown>> {
-  const conversations = clientConversations();
-  if (conversations) {
+  return withRequestTimeout(async (signal) => {
     try {
-      return await conversations.retrieve(conversationId);
+      const client = await getConversationClient();
+      return await client.conversations.retrieve(conversationId);
     } catch (sdkError) {
       try {
-        return await restConversation(conversationId);
+        return await restConversation(conversationId, { signal });
       } catch (restError) {
         throw new Error(`sdk: ${errorText(sdkError)}; rest: ${errorText(restError)}`);
       }
     }
-  }
-  return restConversation(conversationId);
+  }, `read ${conversationId}`);
 }
 
 /** Patch a conversation, preferring the SDK and falling back to REST. */
 async function updateConversation(conversationId: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const conversations = clientConversations();
-  if (conversations) {
+  return withRequestTimeout(async (signal) => {
     try {
-      return await conversations.update(conversationId, body);
+      const client = await getConversationClient();
+      return await client.conversations.update(conversationId, body);
     } catch (sdkError) {
       try {
-        return await restConversation(conversationId, { method: "PATCH", body });
+        return await restConversation(conversationId, { method: "PATCH", body, signal });
       } catch (restError) {
         throw new Error(`sdk: ${errorText(sdkError)}; rest: ${errorText(restError)}`);
       }
     }
-  }
-  return restConversation(conversationId, { method: "PATCH", body });
+  }, `update ${conversationId}`);
 }
 
 function errorText(error: unknown): string {
@@ -290,6 +319,16 @@ function resolveSwitch(
   };
 }
 
+function readReasoningEffort(settings: Record<string, unknown>): ReasoningEffort | null {
+  const reasoning = settings.reasoning && typeof settings.reasoning === "object" && !Array.isArray(settings.reasoning)
+    ? settings.reasoning as Record<string, unknown>
+    : {};
+  for (const value of [reasoning.reasoning_effort, settings.effort, settings.reasoning_effort]) {
+    if (isReasoningEffort(value)) return value;
+  }
+  return null;
+}
+
 /**
  * Switch model and apply the profile.
  *
@@ -311,21 +350,25 @@ async function applySwitch(ctx: ProfilesContext, options: SwitchOptions) {
   if (options.reasoningEffort !== undefined) payload.reasoningEffort = options.reasoningEffort;
   await updateLlmConfig.call(ctx.conversation, payload);
 
-  let maxOutputApplied: number | null = null;
+  let maxOutput: MaxOutputStatus = { status: "not_applicable" };
   const wantMaxOutput = options.maxOutputTokens;
   const conversationId = ctx.conversation?.id ?? ctx.sessionId ?? null;
   if (scope === "conversation" && isPositiveNumber(wantMaxOutput) && conversationId) {
+    const wanted = Math.floor(wantMaxOutput);
     try {
       const live = await retrieveConversation(conversationId);
       const current = (live.model_settings && typeof live.model_settings === "object" && !Array.isArray(live.model_settings)
         ? { ...(live.model_settings as Record<string, unknown>) }
         : {}) as Record<string, unknown>;
-      if (current.max_output_tokens !== Math.floor(wantMaxOutput)) {
-        current.max_output_tokens = Math.floor(wantMaxOutput);
+      if (current.max_output_tokens === wanted) {
+        maxOutput = { status: "unchanged", value: wanted };
+      } else {
+        current.max_output_tokens = wanted;
         await updateConversation(conversationId, { model_settings: current });
-        maxOutputApplied = Math.floor(wantMaxOutput);
+        maxOutput = { status: "written", value: wanted };
       }
     } catch (error) {
+      maxOutput = { status: "failed", value: wanted, error: errorText(error) };
       reportWarning(`model-profiles: switched model but could not set max output tokens: ${errorText(error)}`);
     }
   }
@@ -333,7 +376,8 @@ async function applySwitch(ctx: ProfilesContext, options: SwitchOptions) {
   return {
     model: options.model,
     context_window: (payload.contextWindow as number | undefined) ?? null,
-    max_output_tokens: maxOutputApplied,
+    max_output_tokens: maxOutput.status === "written" ? maxOutput.value : null,
+    max_output_status: maxOutput,
     reasoning_effort: options.reasoningEffort ?? null,
     scope,
     effective: "next turn",
@@ -341,9 +385,14 @@ async function applySwitch(ctx: ProfilesContext, options: SwitchOptions) {
 }
 
 function describeSwitch(result: Awaited<ReturnType<typeof applySwitch>>, fromProfile: boolean): string {
+  const maxOutput = result.max_output_status;
+  const maxOutputText = maxOutput.status === "written" ? `${maxOutput.value.toLocaleString()} tokens`
+    : maxOutput.status === "unchanged" ? `${maxOutput.value.toLocaleString()} tokens (already applied)`
+    : maxOutput.status === "failed" ? `write failed (${maxOutput.error})`
+    : "provider default";
   const parts = [
     `context: ${result.context_window ? `${result.context_window.toLocaleString()} tokens` : "provider default"}`,
-    `max output: ${result.max_output_tokens ? `${result.max_output_tokens.toLocaleString()} tokens` : "provider default"}`,
+    `max output: ${maxOutputText}`,
     ...(result.reasoning_effort ? [`reasoning: ${result.reasoning_effort}`] : []),
     `scope: ${result.scope}`,
   ];
@@ -393,8 +442,11 @@ export function parseCommandArgs(argv: string[]): { sub: string; positional: str
  *
  * `model_settings` is replaced wholesale by the API, not merged, so the patch must
  * carry the conversation's existing settings with only the profiled fields
- * overridden. Without that, the write drops provider_type / parallel_tool_calls /
- * reasoning.
+ * overridden. Without that, the write drops provider_type / parallel_tool_calls.
+ *
+ * Reasoning effort goes through `updateLlmConfig`, not a direct settings patch:
+ * the harness resolves the current model and builds the provider-specific shape
+ * (`reasoning.reasoning_effort`, `effort`, or flat `reasoning_effort`).
  *
  * Returns a short description when a write happened, or null when nothing needed
  * to change — the common case, and the reason this is cheap to call on every turn.
@@ -424,18 +476,23 @@ async function reconcileConversation(
 
   const liveMaxOutput = typeof settings.max_output_tokens === "number" ? settings.max_output_tokens : null;
   const liveContextWindow = typeof live.context_window_limit === "number" ? live.context_window_limit : null;
+  const liveReasoningEffort = readReasoningEffort(settings);
 
   const wantContextWindow = profile.profile.contextWindow;
   const wantMaxOutput = profile.profile.maxOutputTokens;
+  const wantReasoningEffort = profile.profile.reasoningEffort;
 
   const needsContextWindow = wantContextWindow > 0 && liveContextWindow !== wantContextWindow;
   const needsMaxOutput = typeof wantMaxOutput === "number" && wantMaxOutput > 0 && liveMaxOutput !== wantMaxOutput;
-  if (!needsContextWindow && !needsMaxOutput) return null;
+  const needsReasoningEffort = isReasoningEffort(wantReasoningEffort) && liveReasoningEffort !== wantReasoningEffort;
+  if (!needsContextWindow && !needsMaxOutput && !needsReasoningEffort) return null;
 
-  const patch: Record<string, unknown> = {};
   const changed: string[] = [];
+  const patch: Record<string, unknown> = {};
+  const llmConfig: Record<string, unknown> = { scope: "conversation" };
   if (needsContextWindow) {
     patch.context_window_limit = wantContextWindow;
+    llmConfig.contextWindow = wantContextWindow;
     changed.push(`context ${liveContextWindow ?? "?"} -> ${wantContextWindow}`);
   }
   if (needsMaxOutput) {
@@ -443,12 +500,34 @@ async function reconcileConversation(
     patch.model_settings = settings;
     changed.push(`max output ${liveMaxOutput ?? "?"} -> ${wantMaxOutput}`);
   }
+  if (needsReasoningEffort) {
+    llmConfig.reasoningEffort = wantReasoningEffort;
+    changed.push(`reasoning ${liveReasoningEffort ?? "provider default"} -> ${wantReasoningEffort}`);
+  }
 
-  try {
-    await updateConversation(conversationId, patch);
-  } catch (error) {
-    reportWarning(`model-profiles: could not apply ${profile.handle} to ${conversationId}: ${errorText(error)}`);
+  // One official mod-API call handles context and reasoning together. Passing no
+  // model preserves the current model while rebuilding provider-specific settings.
+  const updateLlmConfig = ctx.conversation?.updateLlmConfig;
+  if (typeof updateLlmConfig === "function" && Object.keys(llmConfig).length > 1) {
+    try {
+      await updateLlmConfig.call(ctx.conversation, llmConfig);
+      if (needsContextWindow) delete patch.context_window_limit;
+    } catch (error) {
+      reportWarning(`model-profiles: could not apply ${profile.handle} to ${conversationId}: ${errorText(error)}`);
+      return null;
+    }
+  } else if (needsReasoningEffort) {
+    reportWarning(`model-profiles: could not apply ${profile.handle} reasoning effort to ${conversationId}: ctx.conversation.updateLlmConfig is not available in this Letta Code runtime.`);
     return null;
+  }
+
+  if (Object.keys(patch).length > 0) {
+    try {
+      await updateConversation(conversationId, patch);
+    } catch (error) {
+      reportWarning(`model-profiles: could not apply ${profile.handle} to ${conversationId}: ${errorText(error)}`);
+      return null;
+    }
   }
   return `${profile.handle}: ${changed.join(", ")}`;
 }
@@ -469,12 +548,13 @@ export default function activate(letta: any) {
     reportWarning = (message) => letta.diagnostics.report({ message, severity: "warning" });
   }
 
-  // `letta.client` is a lazy proxy over the SDK client. Capture it once here: event
-  // contexts do not carry a client, and `updateLlmConfig` cannot set max output tokens.
-  // Assign unconditionally so a reload that lacks a client clears stale state.
+  // `getClient` is the official mod-API entry point. `client` is its lazy-proxy
+  // shorthand; keep both for older hosts. Neither is available in listener mods.
   sdkClient = (letta?.client as LettaClientLike | undefined) ?? null;
-  if (!sdkClient && !(restBaseUrl() && restApiKey())) {
-    reportWarning("model-profiles: no conversation transport (no SDK client and no LETTA_BASE_URL/LETTA_API_KEY); limits will not be enforced.");
+  resolveClient = typeof letta?.getClient === "function" ? () => letta.getClient() as Promise<LettaClientLike> : null;
+  clientPromise = null;
+  if (!sdkClient && !resolveClient && !(restBaseUrl() && restApiKey())) {
+    reportWarning("model-profiles: no conversation transport (no mod client and no LETTA_BASE_URL/LETTA_API_KEY); limits will not be enforced.");
   }
 
   if (letta.capabilities.tools) {
@@ -739,5 +819,7 @@ export default function activate(letta: any) {
     });
     reportWarning = () => {};
     sdkClient = null;
+    resolveClient = null;
+    clientPromise = null;
   };
 }

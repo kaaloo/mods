@@ -18,12 +18,12 @@ Profiles are applied in three situations, so a switch made anywhere is corrected
 2. On `conversation_open`, where lifecycle events are available.
 3. On **every turn start**, which is what makes it work in listener/Desktop sessions.
 
-The third is the important one. A model changed through the UI picker never goes through this mod, so the conversation silently reverts to catalog placeholders. On each turn the mod reads the active conversation and rewrites only the fields that differ from the saved profile. When everything already matches, it reads once and writes nothing, which is the common case.
+The third is the important one. A model changed through the UI picker never goes through this mod, so the conversation silently reverts to catalog placeholders. On each turn the mod reads the active conversation and rewrites only the fields that differ from the saved profile, including reasoning effort. When everything already matches, it reads once and writes nothing, which is the common case. Every request has a five-second timeout: a stalled API produces a warning and does not hold up the turn.
 
 Two details explain the shape of this code:
 
 - `updateLlmConfig` carries model, context window, and reasoning effort but cannot express `max_output_tokens`. That field is written separately through the conversation API, re-reading the live `model_settings` first so `provider_type`, `parallel_tool_calls`, reasoning, and other settings are preserved. The API replaces `model_settings` wholesale rather than merging it, so a naive write would silently drop them.
-- Listener-hosted mods receive a `letta.client` that is a truthy lazy proxy whose calls throw. A non-null client is therefore not evidence that it works. Reads and writes try the SDK first and fall back to authenticated REST using `LETTA_BASE_URL` and `LETTA_API_KEY`, which the listener process carries in its environment. If neither transport is available, the mod reports a warning instead of failing silently.
+- `letta.getClient()` is the primary transport. Listener-hosted mods cannot use it, however, and their conversation handle has no record-read API. Reads and writes therefore fall back to authenticated REST using `LETTA_BASE_URL` and `LETTA_API_KEY`, which the listener process carries in its environment. The key is sent only to the configured Letta origin. If neither transport is available, the mod reports a warning instead of failing silently.
 
 ## Install
 
@@ -99,4 +99,4 @@ Changes take effect on the next turn.
 npm test
 ```
 
-The suite covers profile storage, command parsing, and — against a fake conversation API — enforcement on turn start, re-enforcement after a model switch made outside the mod, preservation of unrelated `model_settings`, and the listener case where `letta.client` throws.
+The suite covers profile storage, command parsing, and — against a fake conversation API — enforcement on turn start, re-enforcement after a model switch made outside the mod, reasoning restoration, preservation of unrelated `model_settings`, request timeouts, the listener case where `letta.client` throws, and distinct max-output write/already-applied/failure reporting.

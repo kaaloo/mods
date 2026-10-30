@@ -351,7 +351,7 @@ test("command handler falls back to splitting ctx.args when argv is absent", asy
 //      listener mode `letta.client` is a truthy proxy whose calls throw.
 // ---------------------------------------------------------------------------
 
-function createEnforcingHarness({ client = null } = {}) {
+function createEnforcingHarness({ client = null, getClient = null } = {}) {
   const events = new Map();
   const warnings = [];
   const dispose = activate({
@@ -366,6 +366,7 @@ function createEnforcingHarness({ client = null } = {}) {
     },
     diagnostics: { report({ message }) { warnings.push(message); } },
     client,
+    ...(getClient ? { getClient } : {}),
   });
   return { events, warnings, dispose };
 }
@@ -436,8 +437,9 @@ test("turn_start restores both limits over REST when letta.client is a throwing 
   };
   const harness = createEnforcingHarness({ client: throwingClient });
   t.after(harness.dispose);
+  const ctx = { memfs: { memoryDir: memory } };
 
-  await harness.events.get("turn_start")({ conversationId: "conv-listener" }, { memfs: { memoryDir: memory } });
+  await harness.events.get("turn_start")({ conversationId: "conv-listener" }, ctx);
 
   const record = conversations.store.get("conv-listener");
   assert.equal(record.context_window_limit, 1000000);
@@ -445,6 +447,118 @@ test("turn_start restores both limits over REST when letta.client is a throwing 
   // Unrelated settings must survive: the API replaces model_settings wholesale.
   assert.equal(record.model_settings.provider_type, "opencode_go");
   assert.equal(record.model_settings.parallel_tool_calls, true);
+});
+
+test("turn_start restores reasoning effort through updateLlmConfig after an external switch", async (t) => {
+  const memory = await tempMemoryDir(t);
+  const conversations = fakeConversations({
+    "conv-reasoning": {
+      id: "conv-reasoning",
+      model: "lc_opencode_go/deepseek-v4.1-flash",
+      context_window_limit: 1000000,
+      model_settings: { provider_type: "opencode_go", max_output_tokens: 384000 },
+    },
+  });
+  await withRestServer(t, conversations);
+  await seedProfile(memory, "lc_opencode_go/deepseek-v4.1-flash", {
+    contextWindow: 1000000,
+    maxOutputTokens: 384000,
+    reasoningEffort: "high",
+  });
+
+  const harness = createEnforcingHarness();
+  t.after(harness.dispose);
+  const updates = [];
+  const ctx = {
+    memfs: { memoryDir: memory },
+    conversation: {
+      id: "conv-reasoning",
+      async updateLlmConfig(options) {
+        updates.push(options);
+        // Runtime-faithful OpenAI-family encoding: do not require a model switch.
+        conversations.store.get("conv-reasoning").model_settings.reasoning = { reasoning_effort: options.reasoningEffort };
+      },
+    },
+  };
+
+  await harness.events.get("turn_start")({ conversationId: "conv-reasoning" }, ctx);
+
+  assert.deepEqual(updates, [{ scope: "conversation", reasoningEffort: "high" }]);
+  assert.equal(conversations.store.get("conv-reasoning").model_settings.reasoning.reasoning_effort, "high");
+  assert.deepEqual(conversations.calls, ["GET conv-reasoning"]);
+  assert.match(harness.warnings.at(-1), /reasoning provider default -> high/);
+
+  // A profile that has already taken effect remains read-only.
+  conversations.calls.length = 0;
+  updates.length = 0;
+  await harness.events.get("turn_start")({ conversationId: "conv-reasoning" }, ctx);
+  assert.deepEqual(updates, []);
+  assert.deepEqual(conversations.calls, ["GET conv-reasoning"]);
+});
+
+test("reconcile accepts the flat and Anthropic reasoning settings shapes", async (t) => {
+  const memory = await tempMemoryDir(t);
+  const conversations = fakeConversations({
+    "conv-flat": {
+      id: "conv-flat",
+      model: "moonshot/kimi-k3",
+      context_window_limit: 250000,
+      model_settings: { provider_type: "moonshot", reasoning_effort: "high" },
+    },
+    "conv-anthropic": {
+      id: "conv-anthropic",
+      model: "anthropic/claude-opus-4-8",
+      context_window_limit: 250000,
+      model_settings: { provider_type: "anthropic", effort: "high" },
+    },
+  });
+  await withRestServer(t, conversations);
+  await seedProfiles(memory, {
+    "moonshot/kimi-k3": { contextWindow: 250000, reasoningEffort: "high" },
+    "anthropic/claude-opus-4-8": { contextWindow: 250000, reasoningEffort: "high" },
+  });
+  const harness = createEnforcingHarness();
+  t.after(harness.dispose);
+  conversations.calls.length = 0;
+
+  await harness.events.get("turn_start")({ conversationId: "conv-flat" }, { memfs: { memoryDir: memory } });
+  await harness.events.get("turn_start")({ conversationId: "conv-anthropic" }, { memfs: { memoryDir: memory } });
+
+  assert.deepEqual(conversations.calls, ["GET conv-flat", "GET conv-anthropic"]);
+});
+
+test("getClient is used before the deprecated REST fallback", async (t) => {
+  const memory = await tempMemoryDir(t);
+  const conversations = fakeConversations({
+    "conv-sdk": {
+      id: "conv-sdk",
+      model: "anthropic/claude-opus-4-8",
+      context_window_limit: 128000,
+      model_settings: { provider_type: "anthropic", max_output_tokens: 4096 },
+    },
+  });
+  await withRestServer(t, conversations);
+  await seedProfile(memory, "anthropic/claude-opus-4-8", { contextWindow: 250000, maxOutputTokens: 32000 });
+  const updates = [];
+  const client = {
+    conversations: {
+      async retrieve(id) { return conversations.store.get(id); },
+      async update(id, body) { updates.push({ id, body }); return conversations.store.get(id); },
+    },
+  };
+  const harness = createEnforcingHarness({ getClient: async () => client });
+  t.after(harness.dispose);
+
+  await harness.events.get("turn_start")({ conversationId: "conv-sdk" }, { memfs: { memoryDir: memory } });
+
+  assert.deepEqual(updates, [{
+    id: "conv-sdk",
+    body: {
+      context_window_limit: 250000,
+      model_settings: { provider_type: "anthropic", max_output_tokens: 32000 },
+    },
+  }]);
+  assert.deepEqual(conversations.calls, []);
 });
 
 test("a later model switch is re-enforced (no one-shot latch)", async (t) => {
@@ -542,6 +656,78 @@ test("switching a model applies max output tokens through the conversation API",
   const record = conversations.store.get("conv-1");
   assert.equal(record.model_settings.max_output_tokens, 32000);
   assert.equal(record.model_settings.parallel_tool_calls, true);
+});
+
+test("switch reports an unchanged max output limit without claiming a write", async (t) => {
+  const memory = await tempMemoryDir(t);
+  const conversations = fakeConversations({
+    "conv-1": {
+      id: "conv-1",
+      model: "anthropic/claude-opus-4-8",
+      context_window_limit: 200000,
+      model_settings: { provider_type: "anthropic", max_output_tokens: 32000 },
+    },
+  });
+  await withRestServer(t, conversations);
+  await seedProfile(memory, "xai/grok-4-6", { contextWindow: 250000, maxOutputTokens: 32000 });
+  const harness = createHarness();
+  t.after(harness.dispose);
+  const { ctx } = createContext(memory);
+
+  const result = await runCommand(harness, ctx, "switch xai/grok-4-6");
+
+  assert.equal(result.success, true);
+  assert.match(result.output, /max output: 32,000 tokens \(already applied\)/);
+  assert.deepEqual(conversations.calls, ["GET conv-1"]);
+});
+
+test("switch reports a failed max output write rather than provider default", async (t) => {
+  const memory = await tempMemoryDir(t);
+  const conversations = fakeConversations({
+    "conv-1": {
+      id: "conv-1",
+      model: "anthropic/claude-opus-4-8",
+      context_window_limit: 200000,
+      model_settings: { provider_type: "anthropic", max_output_tokens: 8192 },
+    },
+  });
+  const failingFetch = async (url, init = {}) => {
+    if (init.method === "PATCH") return new Response("write rejected", { status: 403 });
+    return conversations.fetchImpl(url, init);
+  };
+  await withRestServer(t, { ...conversations, fetchImpl: failingFetch });
+  await seedProfile(memory, "xai/grok-4-6", { contextWindow: 250000, maxOutputTokens: 32000 });
+  const harness = createHarness();
+  t.after(harness.dispose);
+  const { ctx } = createContext(memory);
+
+  const result = await runCommand(harness, ctx, "switch xai/grok-4-6");
+
+  assert.equal(result.success, true);
+  assert.match(result.output, /max output: write failed \(.*HTTP 403/);
+  assert.doesNotMatch(result.output, /max output: provider default/);
+  assert.equal(conversations.store.get("conv-1").model_settings.max_output_tokens, 8192);
+});
+
+test("a stalled conversation read times out and lets the turn proceed", async (t) => {
+  const memory = await tempMemoryDir(t);
+  await seedProfile(memory, "anthropic/claude-opus-4-8", { contextWindow: 250000 });
+  let fetchSignal;
+  const stalledFetch = (_url, init) => {
+    fetchSignal = init.signal;
+    return new Promise(() => {});
+  };
+  await withRestServer(t, { fetchImpl: stalledFetch });
+  const harness = createEnforcingHarness();
+  t.after(harness.dispose);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+
+  const turn = harness.events.get("turn_start")({ conversationId: "conv-stalled" }, { memfs: { memoryDir: memory } });
+  t.mock.timers.tick(5000);
+  await turn;
+
+  assert.equal(fetchSignal.aborted, true);
+  assert.match(harness.warnings.at(-1), /timed out after 5000ms/);
 });
 
 test("a missing transport is reported instead of failing silently", async (t) => {

@@ -20,14 +20,16 @@ Use this mod when a model should always run with a saved context window limit, m
 ## Enforcement on conversation start and every turn
 
 - On `conversation_open` (where lifecycle events exist) and on every `turn_start`, the mod reads the active conversation and applies the profile for its model when the live values differ.
-- Only the diverging fields are written. `model_settings` is replaced wholesale by the API, so the write carries the conversation's existing settings with only `max_output_tokens` overridden. Without that, `provider_type`, `parallel_tool_calls`, reasoning, and other settings would be dropped.
-- A model with no saved profile is left untouched. A conversation whose values already match is read once and not written, which is the common case.
+- Only the diverging fields are written. Context and reasoning are applied with `ctx.conversation.updateLlmConfig({ contextWindow?, reasoningEffort?, scope: "conversation" })`; omitting `model` preserves the current model and lets the harness build the provider-specific reasoning shape. `max_output_tokens` is merged into the conversation's existing `model_settings` because the API replaces that object wholesale. Without that, `provider_type`, `parallel_tool_calls`, and other settings would be dropped.
+- A model with no saved profile is left untouched. A conversation whose values already match is read once and not written, which is the common case. Reasoning is compared across the harness-supported shapes: `reasoning.reasoning_effort`, flat `reasoning_effort`, and `effort`.
 - There is deliberately no per-conversation "already applied" latch: `ctx.model.id` resolves from the agent record in listener mode, not from the conversation, so a later UI model change is only observable from the conversation record itself.
 
 ## Transport
 
-- `letta.client` is captured at activation, because event contexts do not carry a client.
-- In listener-hosted sessions that value is a truthy lazy proxy whose calls throw, so a non-null client is not evidence that it works. Every read and write tries the SDK and falls back to authenticated REST at `${LETTA_BASE_URL}/v1/conversations/{id}` using `LETTA_API_KEY`, both of which the listener process carries.
+- `letta.getClient()` is the primary transport, with `letta.client` kept for compatibility with older hosts. The client is captured at activation because event contexts do not carry one.
+- In listener-hosted sessions both mod-client paths are unavailable. Reads and writes therefore fall back to authenticated REST at `${LETTA_BASE_URL}/v1/conversations/{id}` using `LETTA_API_KEY`, both of which the listener process carries. The credential is sent only to that configured Letta origin.
+- This REST path is a deliberately constrained compatibility fallback: the mod conversation handle can write model/reasoning/context settings, but exposes no conversation record read for `model_settings`. Listener enforcement and the separate max-output write need that read. A supported scoped read or `maxOutputTokens` on `updateLlmConfig` would remove the need for it.
+- Every conversation read/write is bounded to 5 seconds. A stalled request is aborted and reported as a warning, so profile enforcement cannot indefinitely block a turn.
 - With no SDK and no REST credentials the mod reports a warning diagnostic rather than failing silently.
 
 ## Storage and recovery
