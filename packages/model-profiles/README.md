@@ -1,12 +1,29 @@
 # @letta-ai/model-profiles
 
-Letta Code mod that remembers a preferred context window limit and reasoning effort for each model, and applies them in the same update when you switch to that model.
+Letta Code mod that remembers a preferred context window limit, max output tokens, and reasoning effort for each model, and applies them in the same update when you switch to that model.
 
 ## Why
 
-Context window and reasoning settings are per-model. When you switch models, the new model starts from its own defaults, not from whatever you had tuned on the previous one. If you want Grok capped at 250,000 tokens, or a specific model always on `xhigh` reasoning, you have to set that again after every switch.
+Context window, max output tokens, and reasoning settings are per-model. When you switch models, the new model starts from its own defaults, not from whatever you had tuned on the previous one. If you want Grok capped at 250,000 tokens, or a specific model always on `xhigh` reasoning, you have to set that again after every switch.
 
-This mod stores those preferences as a profile per model handle and applies model, context window, and reasoning effort together through `ctx.conversation.updateLlmConfig`.
+That matters most for models whose catalog entry carries placeholder limits. A `byok`/proxy model is registered with a uniform default — commonly 128,000 context and 16,384 max output — regardless of what the provider actually supports, and a model switch resets the conversation to those values.
+
+This mod stores those preferences as a profile per model handle and applies model, context window, max output tokens, and reasoning effort together.
+
+## Enforcement (not just on switch)
+
+Profiles are applied in three situations, so a switch made anywhere is corrected:
+
+1. When you use `/model-profile switch` or the `switch_model_profile` tool.
+2. On `conversation_open`, where lifecycle events are available.
+3. On **every turn start**, which is what makes it work in listener/Desktop sessions.
+
+The third is the important one. A model changed through the UI picker never goes through this mod, so the conversation silently reverts to catalog placeholders. On each turn the mod reads the active conversation and rewrites only the fields that differ from the saved profile. When everything already matches, it reads once and writes nothing, which is the common case.
+
+Two details explain the shape of this code:
+
+- `updateLlmConfig` carries model, context window, and reasoning effort but cannot express `max_output_tokens`. That field is written separately through the conversation API, re-reading the live `model_settings` first so `provider_type`, `parallel_tool_calls`, reasoning, and other settings are preserved. The API replaces `model_settings` wholesale rather than merging it, so a naive write would silently drop them.
+- Listener-hosted mods receive a `letta.client` that is a truthy lazy proxy whose calls throw. A non-null client is therefore not evidence that it works. Reads and writes try the SDK first and fall back to authenticated REST using `LETTA_BASE_URL` and `LETTA_API_KEY`, which the listener process carries in its environment. If neither transport is available, the mod reports a warning instead of failing silently.
 
 ## Install
 
@@ -37,12 +54,13 @@ Writes go to a temporary file and are renamed into place, so an interrupted writ
 
 ```
 /model-profile list
-/model-profile set <model> <context-window> [reasoning] [label...]
-/model-profile switch <model-or-label...> [--scope conversation|agent]
+/model-profile set <model> <context-window> [reasoning] [--max-output <tokens>] [label...]
+/model-profile switch <model-or-label...> [--scope conversation|agent] [--max-output <tokens>]
 /model-profile remove <model-or-label...>
 ```
 
 - `reasoning` is one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`.
+- `--max-output` sets the preferred max output tokens, and is optional everywhere.
 - Labels can contain spaces and are matched case-insensitively.
 - `--scope` accepts `--scope agent`, `--scope=agent`, or the shorthand `--agent`. It may appear anywhere in the command.
 
@@ -50,6 +68,7 @@ Example:
 
 ```
 /model-profile set xai/grok-4-6 250000 xhigh Grok 4.6
+/model-profile set lc_opencode_go/deepseek-v4.1-flash 1000000 --max-output 384000
 /model-profile switch Grok 4.6
 /model-profile switch anthropic/claude-opus-4-8 --scope agent
 ```
@@ -60,10 +79,10 @@ If no profile matches, the model is still switched and the output says that prov
 
 The agent can call the same operations:
 
-- `list_model_profiles` - saved profiles plus the current model, context window, and reasoning effort
-- `set_model_profile` - `model`, `context_window`, optional `reasoning_effort`, optional `label`
-- `switch_model_profile` - `model` (handle or label), optional `scope`, optional `context_window` and `reasoning_effort` overrides that win over the saved profile
-- `delete_model_profile` - `model` (handle or label)
+- `list_model_profiles` — saved profiles plus the current model, context window, and reasoning effort
+- `set_model_profile` — `model`, `context_window`, optional `max_output_tokens`, optional `reasoning_effort`, optional `label`
+- `switch_model_profile` — `model` (handle or label), optional `scope`, optional `context_window`, `max_output_tokens` and `reasoning_effort` overrides that win over the saved profile
+- `delete_model_profile` — `model` (handle or label)
 
 `list_model_profiles` is parallel-safe. The three tools that write or switch are not, so the runtime serialises them.
 
@@ -79,3 +98,5 @@ Changes take effect on the next turn.
 ```bash
 npm test
 ```
+
+The suite covers profile storage, command parsing, and — against a fake conversation API — enforcement on turn start, re-enforcement after a model switch made outside the mod, preservation of unrelated `model_settings`, and the listener case where `letta.client` throws.

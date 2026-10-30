@@ -339,3 +339,247 @@ test("command handler falls back to splitting ctx.args when argv is absent", asy
   assert.equal(result.success, true);
   assert.equal(readProfiles(ctx).profiles["a/b"].label, "Some Label");
 });
+
+// ---------------------------------------------------------------------------
+// Profile enforcement against the live conversation record.
+//
+// These cover the two failures that made profiles unreliable in practice:
+//   1. `updateLlmConfig` cannot carry max_output_tokens, so a profile only ever
+//      restored half its settings.
+//   2. Nothing re-applied a profile after a model change made outside this mod
+//      (the UI picker resets the conversation to catalog placeholders), and in
+//      listener mode `letta.client` is a truthy proxy whose calls throw.
+// ---------------------------------------------------------------------------
+
+function createEnforcingHarness({ client = null } = {}) {
+  const events = new Map();
+  const warnings = [];
+  const dispose = activate({
+    capabilities: { tools: true, commands: true, events: { lifecycle: true, turns: true } },
+    tools: { register: () => () => {} },
+    commands: { register: () => () => {} },
+    events: {
+      on(name, handler) {
+        events.set(name, handler);
+        return () => events.delete(name);
+      },
+    },
+    diagnostics: { report({ message }) { warnings.push(message); } },
+    client,
+  });
+  return { events, warnings, dispose };
+}
+
+/** A conversation store behind a fake REST endpoint, shaped like the real API. */
+function fakeConversations(initial) {
+  const store = new Map(Object.entries(initial).map(([id, value]) => [id, { ...value }]));
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    const id = decodeURIComponent(String(url).split("/v1/conversations/")[1] ?? "");
+    const method = init.method ?? "GET";
+    calls.push(`${method} ${id}`);
+    const record = store.get(id);
+    if (!record) return new Response("not found", { status: 404 });
+    if (method === "PATCH") {
+      const body = JSON.parse(init.body ?? "{}");
+      if (typeof body.context_window_limit === "number") record.context_window_limit = body.context_window_limit;
+      if (body.model_settings) record.model_settings = { ...body.model_settings };
+      if (typeof body.model === "string") record.model = body.model;
+    }
+    return new Response(JSON.stringify(record), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  return { store, calls, fetchImpl };
+}
+
+async function withRestServer(t, conversations) {
+  const previous = { fetch: globalThis.fetch, base: process.env.LETTA_BASE_URL, key: process.env.LETTA_API_KEY };
+  globalThis.fetch = conversations.fetchImpl;
+  process.env.LETTA_BASE_URL = "https://api.example.test";
+  process.env.LETTA_API_KEY = "test-key";
+  t.after(() => {
+    globalThis.fetch = previous.fetch;
+    for (const [name, value] of [["LETTA_BASE_URL", previous.base], ["LETTA_API_KEY", previous.key]]) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+}
+
+async function seedProfile(memoryDir, handle, profile) {
+  writeProfiles({ memfs: { memoryDir } }, { version: 1, profiles: { [handle]: profile } });
+}
+
+/** Seed several profiles at once; writeProfiles replaces the whole file. */
+async function seedProfiles(memoryDir, profiles) {
+  writeProfiles({ memfs: { memoryDir } }, { version: 1, profiles });
+}
+
+test("turn_start restores both limits over REST when letta.client is a throwing proxy", async (t) => {
+  const memory = await tempMemoryDir(t);
+  const conversations = fakeConversations({
+    "conv-listener": {
+      id: "conv-listener",
+      model: "lc_opencode_go/deepseek-v4.1-flash",
+      context_window_limit: 128000,
+      model_settings: { provider_type: "opencode_go", parallel_tool_calls: true, max_output_tokens: 4096 },
+    },
+  });
+  await withRestServer(t, conversations);
+  await seedProfile(memory, "lc_opencode_go/deepseek-v4.1-flash", { contextWindow: 1000000, maxOutputTokens: 384000 });
+
+  // Listener shape: truthy proxy, every call throws.
+  const throwingClient = {
+    conversations: {
+      retrieve: async () => { throw new Error("letta.client is not available in listener mods"); },
+      update: async () => { throw new Error("letta.client is not available in listener mods"); },
+    },
+  };
+  const harness = createEnforcingHarness({ client: throwingClient });
+  t.after(harness.dispose);
+
+  await harness.events.get("turn_start")({ conversationId: "conv-listener" }, { memfs: { memoryDir: memory } });
+
+  const record = conversations.store.get("conv-listener");
+  assert.equal(record.context_window_limit, 1000000);
+  assert.equal(record.model_settings.max_output_tokens, 384000);
+  // Unrelated settings must survive: the API replaces model_settings wholesale.
+  assert.equal(record.model_settings.provider_type, "opencode_go");
+  assert.equal(record.model_settings.parallel_tool_calls, true);
+});
+
+test("a later model switch is re-enforced (no one-shot latch)", async (t) => {
+  const memory = await tempMemoryDir(t);
+  const conversations = fakeConversations({
+    "conv-switch": {
+      id: "conv-switch",
+      model: "lc_opencode_go/deepseek-v4.1-flash",
+      context_window_limit: 128000,
+      model_settings: { provider_type: "opencode_go", max_output_tokens: 4096 },
+    },
+  });
+  await withRestServer(t, conversations);
+  await seedProfiles(memory, {
+    "lc_opencode_go/deepseek-v4.1-flash": { contextWindow: 1000000, maxOutputTokens: 384000 },
+    "lc_opencode_go/kimi-k3.1-pro": { contextWindow: 1048576, maxOutputTokens: 131072 },
+  });
+
+  const harness = createEnforcingHarness();
+  t.after(harness.dispose);
+  const ctx = { memfs: { memoryDir: memory } };
+  const turnStart = harness.events.get("turn_start");
+
+  await turnStart({ conversationId: "conv-switch" }, ctx);
+  assert.equal(conversations.store.get("conv-switch").context_window_limit, 1000000);
+
+  // Simulate the UI picker: new model, catalog placeholders.
+  const record = conversations.store.get("conv-switch");
+  record.model = "lc_opencode_go/kimi-k3.1-pro";
+  record.context_window_limit = 128000;
+  record.model_settings = { provider_type: "opencode_go", max_output_tokens: 4096 };
+
+  await turnStart({ conversationId: "conv-switch" }, ctx);
+  assert.equal(record.context_window_limit, 1048576);
+  assert.equal(record.model_settings.max_output_tokens, 131072);
+});
+
+test("an already-correct conversation is read but not rewritten", async (t) => {
+  const memory = await tempMemoryDir(t);
+  const conversations = fakeConversations({
+    "conv-ok": {
+      id: "conv-ok",
+      model: "anthropic/claude-opus-4-8",
+      context_window_limit: 250000,
+      model_settings: { provider_type: "anthropic", max_output_tokens: 32000 },
+    },
+  });
+  await withRestServer(t, conversations);
+  await seedProfile(memory, "anthropic/claude-opus-4-8", { contextWindow: 250000, maxOutputTokens: 32000 });
+
+  const harness = createEnforcingHarness();
+  t.after(harness.dispose);
+  conversations.calls.length = 0;
+  await harness.events.get("turn_start")({ conversationId: "conv-ok" }, { memfs: { memoryDir: memory } });
+
+  assert.deepEqual(conversations.calls, ["GET conv-ok"]);
+  assert.equal(harness.warnings.length, 0);
+});
+
+test("a model without a profile is left alone", async (t) => {
+  const memory = await tempMemoryDir(t);
+  const conversations = fakeConversations({
+    "conv-other": { id: "conv-other", model: "nobody/unknown", context_window_limit: 64000, model_settings: {} },
+  });
+  await withRestServer(t, conversations);
+  await seedProfile(memory, "anthropic/claude-opus-4-8", { contextWindow: 250000 });
+
+  const harness = createEnforcingHarness();
+  t.after(harness.dispose);
+  await harness.events.get("turn_start")({ conversationId: "conv-other" }, { memfs: { memoryDir: memory } });
+  assert.equal(conversations.store.get("conv-other").context_window_limit, 64000);
+});
+
+test("switching a model applies max output tokens through the conversation API", async (t) => {
+  const memory = await tempMemoryDir(t);
+  const conversations = fakeConversations({
+    "conv-1": {
+      id: "conv-1",
+      model: "anthropic/claude-opus-4-8",
+      context_window_limit: 200000,
+      model_settings: { provider_type: "anthropic", parallel_tool_calls: true, max_output_tokens: 8192 },
+    },
+  });
+  await withRestServer(t, conversations);
+  await seedProfile(memory, "xai/grok-4-6", { contextWindow: 250000, maxOutputTokens: 32000 });
+
+  const harness = createHarness();
+  t.after(harness.dispose);
+  const { ctx, calls } = createContext(memory);
+  const result = await runCommand(harness, ctx, "switch xai/grok-4-6");
+
+  assert.equal(result.success, true);
+  assert.equal(calls[0].model, "xai/grok-4-6");
+  assert.equal(calls[0].contextWindow, 250000);
+  const record = conversations.store.get("conv-1");
+  assert.equal(record.model_settings.max_output_tokens, 32000);
+  assert.equal(record.model_settings.parallel_tool_calls, true);
+});
+
+test("a missing transport is reported instead of failing silently", async (t) => {
+  const memory = await tempMemoryDir(t);
+  const previous = { base: process.env.LETTA_BASE_URL, key: process.env.LETTA_API_KEY };
+  delete process.env.LETTA_BASE_URL;
+  delete process.env.LETTA_API_KEY;
+  t.after(() => {
+    if (previous.base !== undefined) process.env.LETTA_BASE_URL = previous.base;
+    if (previous.key !== undefined) process.env.LETTA_API_KEY = previous.key;
+  });
+  await seedProfile(memory, "anthropic/claude-opus-4-8", { contextWindow: 250000, maxOutputTokens: 32000 });
+
+  const harness = createEnforcingHarness();
+  t.after(harness.dispose);
+  harness.warnings.length = 0;
+  await harness.events.get("turn_start")({ conversationId: "conv-1" }, { memfs: { memoryDir: memory } });
+
+  assert.ok(harness.warnings.length > 0);
+  assert.match(harness.warnings[0], /could not read/);
+});
+
+test("--max-output is parsed and saved with the profile", async (t) => {
+  const memory = await tempMemoryDir(t);
+  const harness = createHarness();
+  t.after(harness.dispose);
+  const { ctx } = createContext(memory);
+
+  assert.equal(parseCommandArgs(["set", "a/b", "1000", "--max-output", "9000"]).maxOutputTokens, 9000);
+  assert.equal(parseCommandArgs(["set", "a/b", "1000"]).maxOutputTokens, undefined);
+  assert.match(parseCommandArgs(["set", "a/b", "1000", "--max-output", "nope"]).error, /positive integer/);
+
+  const result = await runCommand(harness, ctx, "set a/b 1000 --max-output 9000 A B");
+  assert.equal(result.success, true);
+  const saved = readProfiles(ctx).profiles["a/b"];
+  assert.equal(saved.maxOutputTokens, 9000);
+  assert.equal(saved.label, "A B");
+
+  const listed = await runCommand(harness, ctx, "list");
+  assert.match(listed.output, /max output: 9,000/);
+});
