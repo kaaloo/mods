@@ -531,9 +531,11 @@ async function reconcileConversation(
   // One official mod-API call handles context and reasoning together. Passing no
   // model preserves the current model while rebuilding provider-specific settings.
   const updateLlmConfig = ctx.conversation?.updateLlmConfig;
+  let llmConfigUpdated = false;
   if (typeof updateLlmConfig === "function" && Object.keys(llmConfig).length > 1) {
     try {
       await updateLlmConfig.call(ctx.conversation, llmConfig);
+      llmConfigUpdated = true;
       if (needsContextWindow) delete patch.context_window_limit;
     } catch (error) {
       reportWarning(`model-profiles: could not apply ${profile.handle} to ${conversationId}: ${errorText(error)}`);
@@ -547,7 +549,12 @@ async function reconcileConversation(
   if (Object.keys(patch).length > 0 || needsMaxOutput) {
     try {
       if (Object.keys(patch).length > 0) await updateConversation(conversationId, patch);
-      if (needsMaxOutput) await applyMaxOutput(conversationId, live, wantMaxOutput as number);
+      if (needsMaxOutput) {
+        // updateLlmConfig may have replaced model_settings since the first read.
+        // Refresh before constructing the replacement object for max_output_tokens.
+        const maxOutputLive = llmConfigUpdated ? await retrieveConversation(conversationId) : live;
+        await applyMaxOutput(conversationId, maxOutputLive, wantMaxOutput as number);
+      }
     } catch (error) {
       reportWarning(`model-profiles: could not apply ${profile.handle} to ${conversationId}: ${errorText(error)}`);
       return null;

@@ -497,6 +497,49 @@ test("turn_start restores reasoning effort through updateLlmConfig after an exte
   assert.deepEqual(conversations.calls, ["GET conv-reasoning"]);
 });
 
+test("reasoning and max output reconciliation preserve both OpenCode updates", async (t) => {
+  const memory = await tempMemoryDir(t);
+  const conversations = fakeConversations({
+    "conv-both": {
+      id: "conv-both",
+      model: "lc_opencode_go/deepseek-v4.1-flash",
+      context_window_limit: 1000000,
+      model_settings: { provider_type: "opencode_go", parallel_tool_calls: true, max_output_tokens: 4096 },
+    },
+  });
+  await withRestServer(t, conversations);
+  await seedProfile(memory, "lc_opencode_go/deepseek-v4.1-flash", {
+    contextWindow: 1000000,
+    maxOutputTokens: 384000,
+    reasoningEffort: "high",
+  });
+
+  const harness = createEnforcingHarness();
+  t.after(harness.dispose);
+  const updates = [];
+  const ctx = {
+    memfs: { memoryDir: memory },
+    conversation: {
+      id: "conv-both",
+      async updateLlmConfig(options) {
+        updates.push(options);
+        conversations.store.get("conv-both").model_settings.reasoning = {
+          reasoning_effort: options.reasoningEffort,
+        };
+      },
+    },
+  };
+
+  await harness.events.get("turn_start")({ conversationId: "conv-both" }, ctx);
+
+  const settings = conversations.store.get("conv-both").model_settings;
+  assert.equal(settings.reasoning.reasoning_effort, "high");
+  assert.equal(settings.max_output_tokens, 384000);
+  assert.equal(settings.provider_type, "opencode_go");
+  assert.equal(settings.parallel_tool_calls, true);
+  assert.deepEqual(updates, [{ scope: "conversation", reasoningEffort: "high" }]);
+});
+
 test("reconcile accepts the flat and Anthropic reasoning settings shapes", async (t) => {
   const memory = await tempMemoryDir(t);
   const conversations = fakeConversations({
