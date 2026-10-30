@@ -22,7 +22,7 @@ The third is the important one. A model changed through the UI picker never goes
 
 Two details explain the shape of this code:
 
-- `updateLlmConfig` carries model, context window, and reasoning effort but cannot express `max_output_tokens`. That field is written separately through the conversation API, re-reading the live `model_settings` first so `provider_type`, `parallel_tool_calls`, reasoning, and other settings are preserved. The API replaces `model_settings` wholesale rather than merging it, so a naive write would silently drop them.
+- `updateLlmConfig` carries model, context window, and reasoning effort but cannot express an output-token limit. That limit is written separately, re-reading the live conversation first. For `model_settings.max_output_tokens`, the existing settings are preserved because the API replaces that object wholesale. For records using top-level `max_tokens` (including Kimi-shaped configurations), only that field is sent so provider settings are not replaced.
 - `letta.getClient()` is the primary transport. Listener-hosted mods cannot use it, however, and their conversation handle has no record-read API. Reads and writes therefore fall back to authenticated REST using `LETTA_BASE_URL` and `LETTA_API_KEY`, which the listener process carries in its environment. The key is sent only to the configured Letta origin. If neither transport is available, the mod reports a warning instead of failing silently.
 
 ## Install
@@ -99,4 +99,4 @@ Changes take effect on the next turn.
 npm test
 ```
 
-The suite covers profile storage, command parsing, and — against a fake conversation API — enforcement on turn start, re-enforcement after a model switch made outside the mod, reasoning restoration, preservation of unrelated `model_settings`, request timeouts, the listener case where `letta.client` throws, and distinct max-output write/already-applied/failure reporting.
+The suite covers profile storage, command parsing, and — against a fake conversation API — enforcement on turn start, re-enforcement after a model switch made outside the mod, reasoning restoration, preservation of unrelated `model_settings` for both output-limit representations, request timeouts, the listener case where `letta.client` throws, and distinct max-output write/already-applied/failure reporting.

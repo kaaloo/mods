@@ -319,6 +319,35 @@ function resolveSwitch(
   };
 }
 
+/** Read the output limit from either server representation. */
+function currentMaxOutput(live: Record<string, unknown>): number | null {
+  if (typeof live.max_tokens === "number") return live.max_tokens;
+  const settings = live.model_settings && typeof live.model_settings === "object" && !Array.isArray(live.model_settings)
+    ? live.model_settings as Record<string, unknown>
+    : {};
+  return typeof settings.max_output_tokens === "number" ? settings.max_output_tokens : null;
+}
+
+/** Apply the profile's max output limit without disturbing provider settings. */
+async function applyMaxOutput(
+  conversationId: string,
+  live: Record<string, unknown>,
+  wanted: number,
+): Promise<void> {
+  if (typeof live.max_tokens === "number") {
+    // The server stores max_tokens on Kimi-like configurations and rebuilds
+    // model_settings on update. Including max_output_tokens here would introduce
+    // a second, conflicting output limit; leave that object entirely untouched.
+    await updateConversation(conversationId, { max_tokens: wanted });
+    return;
+  }
+  const current = (live.model_settings && typeof live.model_settings === "object" && !Array.isArray(live.model_settings)
+    ? { ...(live.model_settings as Record<string, unknown>) }
+    : {}) as Record<string, unknown>;
+  current.max_output_tokens = wanted;
+  await updateConversation(conversationId, { model_settings: current });
+}
+
 function readReasoningEffort(settings: Record<string, unknown>): ReasoningEffort | null {
   const reasoning = settings.reasoning && typeof settings.reasoning === "object" && !Array.isArray(settings.reasoning)
     ? settings.reasoning as Record<string, unknown>
@@ -357,14 +386,10 @@ async function applySwitch(ctx: ProfilesContext, options: SwitchOptions) {
     const wanted = Math.floor(wantMaxOutput);
     try {
       const live = await retrieveConversation(conversationId);
-      const current = (live.model_settings && typeof live.model_settings === "object" && !Array.isArray(live.model_settings)
-        ? { ...(live.model_settings as Record<string, unknown>) }
-        : {}) as Record<string, unknown>;
-      if (current.max_output_tokens === wanted) {
+      if (currentMaxOutput(live) === wanted) {
         maxOutput = { status: "unchanged", value: wanted };
       } else {
-        current.max_output_tokens = wanted;
-        await updateConversation(conversationId, { model_settings: current });
+        await applyMaxOutput(conversationId, live, wanted);
         maxOutput = { status: "written", value: wanted };
       }
     } catch (error) {
@@ -474,7 +499,7 @@ async function reconcileConversation(
     ? { ...(live.model_settings as Record<string, unknown>) }
     : {}) as Record<string, unknown>;
 
-  const liveMaxOutput = typeof settings.max_output_tokens === "number" ? settings.max_output_tokens : null;
+  const liveMaxOutput = currentMaxOutput(live);
   const liveContextWindow = typeof live.context_window_limit === "number" ? live.context_window_limit : null;
   const liveReasoningEffort = readReasoningEffort(settings);
 
@@ -496,8 +521,6 @@ async function reconcileConversation(
     changed.push(`context ${liveContextWindow ?? "?"} -> ${wantContextWindow}`);
   }
   if (needsMaxOutput) {
-    settings.max_output_tokens = wantMaxOutput;
-    patch.model_settings = settings;
     changed.push(`max output ${liveMaxOutput ?? "?"} -> ${wantMaxOutput}`);
   }
   if (needsReasoningEffort) {
@@ -521,9 +544,10 @@ async function reconcileConversation(
     return null;
   }
 
-  if (Object.keys(patch).length > 0) {
+  if (Object.keys(patch).length > 0 || needsMaxOutput) {
     try {
-      await updateConversation(conversationId, patch);
+      if (Object.keys(patch).length > 0) await updateConversation(conversationId, patch);
+      if (needsMaxOutput) await applyMaxOutput(conversationId, live, wantMaxOutput as number);
     } catch (error) {
       reportWarning(`model-profiles: could not apply ${profile.handle} to ${conversationId}: ${errorText(error)}`);
       return null;

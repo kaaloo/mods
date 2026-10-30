@@ -386,6 +386,7 @@ function fakeConversations(initial) {
       if (typeof body.context_window_limit === "number") record.context_window_limit = body.context_window_limit;
       if (body.model_settings) record.model_settings = { ...body.model_settings };
       if (typeof body.model === "string") record.model = body.model;
+      if (typeof body.max_tokens === "number") record.max_tokens = body.max_tokens;
     }
     return new Response(JSON.stringify(record), { status: 200, headers: { "Content-Type": "application/json" } });
   };
@@ -551,13 +552,10 @@ test("getClient is used before the deprecated REST fallback", async (t) => {
 
   await harness.events.get("turn_start")({ conversationId: "conv-sdk" }, { memfs: { memoryDir: memory } });
 
-  assert.deepEqual(updates, [{
-    id: "conv-sdk",
-    body: {
-      context_window_limit: 250000,
-      model_settings: { provider_type: "anthropic", max_output_tokens: 32000 },
-    },
-  }]);
+  assert.deepEqual(updates, [
+    { id: "conv-sdk", body: { context_window_limit: 250000 } },
+    { id: "conv-sdk", body: { model_settings: { provider_type: "anthropic", max_output_tokens: 32000 } } },
+  ]);
   assert.deepEqual(conversations.calls, []);
 });
 
@@ -707,6 +705,77 @@ test("switch reports a failed max output write rather than provider default", as
   assert.match(result.output, /max output: write failed \(.*HTTP 403/);
   assert.doesNotMatch(result.output, /max output: provider default/);
   assert.equal(conversations.store.get("conv-1").model_settings.max_output_tokens, 8192);
+});
+
+test("max-output-only reconciliation preserves Kimi provider settings", async (t) => {
+  const memory = await tempMemoryDir(t);
+  const conversations = fakeConversations({
+    "conv-kimi": {
+      id: "conv-kimi",
+      model: "lc-kimi-code/k3.1-pro",
+      context_window_limit: 1048576,
+      max_tokens: 4096,
+      model_settings: {
+        provider_type: "moonshot_coding",
+        parallel_tool_calls: true,
+        temperature: 1,
+        thinking: { type: "enabled", budget_tokens: 1024 },
+      },
+    },
+  });
+  const requests = [];
+  const fetchImpl = async (url, init = {}) => {
+    requests.push({ method: init.method ?? "GET", body: init.body ? JSON.parse(init.body) : null });
+    return conversations.fetchImpl(url, init);
+  };
+  await withRestServer(t, { ...conversations, fetchImpl });
+  await seedProfile(memory, "lc-kimi-code/k3.1-pro", { contextWindow: 1048576, maxOutputTokens: 131072 });
+  const harness = createEnforcingHarness();
+  t.after(harness.dispose);
+  const updates = [];
+  const ctx = {
+    memfs: { memoryDir: memory },
+    conversation: { id: "conv-kimi", async updateLlmConfig(options) { updates.push(options); } },
+  };
+
+  await harness.events.get("turn_start")({ conversationId: "conv-kimi" }, ctx);
+
+  const record = conversations.store.get("conv-kimi");
+  assert.equal(record.max_tokens, 131072);
+  assert.equal(record.model_settings.provider_type, "moonshot_coding");
+  assert.equal(record.model_settings.parallel_tool_calls, true);
+  assert.equal(record.model_settings.temperature, 1);
+  assert.deepEqual(record.model_settings.thinking, { type: "enabled", budget_tokens: 1024 });
+  assert.equal(record.model_settings.max_output_tokens, undefined);
+  assert.deepEqual(updates, []);
+  assert.deepEqual(requests.map(({ method, body }) => ({ method, body })), [
+    { method: "GET", body: null },
+    { method: "PATCH", body: { max_tokens: 131072 } },
+  ]);
+});
+
+test("max-output-only reconciliation merges settings for OpenCode-shaped records", async (t) => {
+  const memory = await tempMemoryDir(t);
+  const conversations = fakeConversations({
+    "conv-opencode": {
+      id: "conv-opencode",
+      model: "lc_opencode_go/deepseek-v4.1-flash",
+      context_window_limit: 1000000,
+      model_settings: { provider_type: "opencode_go", parallel_tool_calls: true, max_output_tokens: 4096 },
+    },
+  });
+  await withRestServer(t, conversations);
+  await seedProfile(memory, "lc_opencode_go/deepseek-v4.1-flash", { contextWindow: 1000000, maxOutputTokens: 384000 });
+  const harness = createEnforcingHarness();
+  t.after(harness.dispose);
+
+  await harness.events.get("turn_start")({ conversationId: "conv-opencode" }, { memfs: { memoryDir: memory } });
+
+  assert.deepEqual(conversations.store.get("conv-opencode").model_settings, {
+    provider_type: "opencode_go",
+    parallel_tool_calls: true,
+    max_output_tokens: 384000,
+  });
 });
 
 test("a stalled conversation read times out and lets the turn proceed", async (t) => {
